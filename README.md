@@ -99,3 +99,7 @@ pytest
 This tool is for **defensive research and education**, to be used only against
 your own models, local models, or systems you are authorized to test. The
 "secrets" in the example targets are fictional canaries.
+
+## License
+
+[MIT](LICENSE) © Vicsar71
