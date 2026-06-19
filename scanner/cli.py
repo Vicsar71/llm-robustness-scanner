@@ -16,8 +16,9 @@ from .judges.claude import DEFAULT_MODEL as DEFAULT_JUDGE_MODEL
 from .judges.claude import ClaudeJudge
 from .judges.heuristic import HeuristicJudge
 from .models import Attack, AttackResult, Verdict
-from .reporter import render_markdown
-from .runner import run_scan
+from .html_reporter import render_comparison_html, render_html
+from .reporter import render_comparison_markdown, render_markdown
+from .runner import run_comparison, run_scan
 from .targets.ollama import OllamaTarget
 
 app = typer.Typer(help="LLM robustness scanner (prompt injection / jailbreaks).")
@@ -29,6 +30,14 @@ class JudgeChoice(str, enum.Enum):
 
     heuristic = "heuristic"  # fast string rules, free, no API key
     claude = "claude"        # nuanced verdicts via the Claude API
+
+
+class OutputFormat(str, enum.Enum):
+    """Which human-readable report(s) to write (JSON data is always written)."""
+
+    md = "md"      # Markdown only
+    html = "html"  # self-contained HTML only
+    both = "both"  # Markdown + HTML
 
 
 def _build_judge(choice: JudgeChoice, judge_model: str) -> Judge:
@@ -92,6 +101,12 @@ def run(
         "--judge-model",
         help="Claude model for the 'claude' judge.",
     ),
+    fmt: OutputFormat = typer.Option(
+        OutputFormat.both,
+        "--format",
+        "-f",
+        help="Report format: 'md', 'html', or 'both' (JSON is always written).",
+    ),
 ) -> None:
     """Run the attack suite against the target model and generate the report."""
     target_cfg = load_target_config(target)
@@ -138,14 +153,124 @@ def run(
         f"[yellow]{s.partial} partial[/yellow] / [dim]{s.error} err[/dim]"
     )
 
+    _write_reports(
+        out,
+        f"report_{report.started_at.replace(':', '-')}",
+        json_text=report.model_dump_json(indent=2),
+        md_text=render_markdown(report) if fmt is not OutputFormat.html else None,
+        html_text=render_html(report) if fmt is not OutputFormat.md else None,
+    )
+
+
+@app.command()
+def compare(
+    target: Path = typer.Option(..., "--target", "-t", help="Target YAML file."),
+    attacks: Path = typer.Option(..., "--attacks", "-a", help="Attacks YAML file."),
+    models: str = typer.Option(
+        ...,
+        "--models",
+        "-m",
+        help="Comma-separated models to compare, e.g. 'llama3.1:8b,phi3:mini'.",
+    ),
+    out: Path = typer.Option(Path("reports"), "--out", "-o", help="Output folder."),
+    host: str = typer.Option("http://localhost:11434", help="Ollama API host."),
+    judge: JudgeChoice = typer.Option(
+        JudgeChoice.heuristic, "--judge", "-j",
+        help="Who decides if an attack worked: 'heuristic' (free) or 'claude'.",
+    ),
+    judge_model: str = typer.Option(
+        DEFAULT_JUDGE_MODEL, "--judge-model",
+        help="Claude model for the 'claude' judge.",
+    ),
+    fmt: OutputFormat = typer.Option(
+        OutputFormat.both, "--format", "-f",
+        help="Report format: 'md', 'html', or 'both' (JSON is always written).",
+    ),
+) -> None:
+    """Run the same attack suite against several models and rank them."""
+    target_cfg = load_target_config(target)
+    attack_list = load_attacks(attacks)
+    model_list = [m.strip() for m in models.split(",") if m.strip()]
+    if not model_list:
+        console.print("[red]No models given.[/red] Use --models 'a,b,c'.")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[bold]Target:[/bold] {target_cfg.name}   "
+        f"[bold]Models:[/bold] {', '.join(model_list)}\n"
+        f"[bold]Attacks:[/bold] {len(attack_list)}   "
+        f"[bold]Judge:[/bold] {judge.value}\n"
+    )
+
+    judge_impl = _build_judge(judge, judge_model)
+
+    def target_factory(model: str):
+        return OllamaTarget(
+            model=model, system_prompt=target_cfg.system_prompt, host=host
+        )
+
+    def on_model(i: int, n: int, model: str) -> None:
+        console.print(f"\n[bold cyan]── Model {i}/{n}: {model} ──[/bold cyan]")
+
+    def on_result(r: AttackResult) -> None:
+        style = _VERDICT_STYLE[r.verdict]
+        console.print(
+            f"    [bold]{r.attack.id}[/bold] → "
+            f"[{style}]{r.verdict.value.upper()}[/{style}] ({r.latency_s}s)"
+        )
+
+    comparison = run_comparison(
+        model_list, target_cfg, attack_list, judge_impl, target_factory,
+        on_model=on_model, on_result=on_result,
+    )
+
+    console.print("\n[bold]🏆 Leaderboard (most robust first):[/bold]")
+    for rank, r in enumerate(
+        sorted(comparison.reports, key=lambda r: r.summary.robustness_score,
+               reverse=True),
+        start=1,
+    ):
+        console.print(
+            f"  {rank}. [cyan]{r.model}[/cyan]  "
+            f"[bold]{r.summary.robustness_score}/100[/bold]  "
+            f"(ASR {r.summary.attack_success_rate}%)"
+        )
+
+    _write_reports(
+        out,
+        f"comparison_{comparison.started_at.replace(':', '-')}",
+        json_text=comparison.model_dump_json(indent=2),
+        md_text=(
+            render_comparison_markdown(comparison)
+            if fmt is not OutputFormat.html else None
+        ),
+        html_text=(
+            render_comparison_html(comparison)
+            if fmt is not OutputFormat.md else None
+        ),
+    )
+
+
+def _write_reports(
+    out: Path,
+    stem: str,
+    json_text: str,
+    md_text: str | None,
+    html_text: str | None,
+) -> None:
+    """Write the JSON data plus whichever human-readable reports were rendered."""
     out.mkdir(parents=True, exist_ok=True)
-    stamp = report.started_at.replace(":", "-")
-    md_path = out / f"report_{stamp}.md"
-    json_path = out / f"report_{stamp}.json"
-    md_path.write_text(render_markdown(report), encoding="utf-8")
-    json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-    console.print(f"\n[green]✔[/green] Markdown report: [bold]{md_path}[/bold]")
-    console.print(f"[green]✔[/green] JSON data:       [bold]{json_path}[/bold]")
+    json_path = out / f"{stem}.json"
+    json_path.write_text(json_text, encoding="utf-8")
+    console.print(f"\n[green]✔[/green] JSON data: [bold]{json_path}[/bold]")
+    if md_text is not None:
+        md_path = out / f"{stem}.md"
+        md_path.write_text(md_text, encoding="utf-8")
+        console.print(f"[green]✔[/green] Markdown:  [bold]{md_path}[/bold]")
+    if html_text is not None:
+        html_path = out / f"{stem}.html"
+        html_path.write_text(html_text, encoding="utf-8")
+        console.print(f"[green]✔[/green] HTML:      [bold]{html_path}[/bold]")
 
 
 if __name__ == "__main__":

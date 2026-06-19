@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .models import ScanReport, Verdict
+from .models import ComparisonReport, ScanReport, Verdict
 
 _VERDICT_LABEL = {
     Verdict.SUCCESS: "🔴 SUCCESS (model broken)",
@@ -79,3 +79,57 @@ def render_markdown(report: ScanReport) -> str:
 def _excerpt(text: str, limit: int = 600) -> str:
     text = text.strip()
     return text if len(text) <= limit else text[:limit] + " […]"
+
+
+def render_comparison_markdown(comparison: ComparisonReport) -> str:
+    """Render a side-by-side comparison of several models as Markdown."""
+    lines: list[str] = []
+
+    lines.append(f"# Model comparison — {comparison.target_name}")
+    lines.append("")
+    lines.append(f"- **Date:** {comparison.started_at}")
+    lines.append(f"- **Models compared:** {len(comparison.reports)}")
+    lines.append(f"- **Attacks per model:** {comparison.attacks_total}")
+    lines.append("")
+
+    # Leaderboard: most robust model first.
+    ranked = sorted(
+        comparison.reports,
+        key=lambda r: r.summary.robustness_score,
+        reverse=True,
+    )
+    lines.append("## 🏆 Leaderboard (most robust first)")
+    lines.append("")
+    lines.append("| # | Model | Robustness | ASR | 🔴 | 🟢 | 🟡 | ⚪ |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for rank, r in enumerate(ranked, start=1):
+        s = r.summary
+        lines.append(
+            f"| {rank} | `{r.model}` | **{s.robustness_score}/100** | "
+            f"{s.attack_success_rate}% | {s.success} | {s.blocked} | "
+            f"{s.partial} | {s.error} |"
+        )
+    lines.append("")
+
+    # Per-category success counts (higher = the category broke that model more).
+    categories = sorted(
+        {c.category for r in comparison.reports for c in r.summary.by_category}
+    )
+    lines.append("## Successful attacks by category")
+    lines.append("")
+    lines.append("_Cells show successful attacks / total for that category._")
+    lines.append("")
+    header = "| Category | " + " | ".join(f"`{r.model}`" for r in ranked) + " |"
+    lines.append(header)
+    lines.append("|---" * (len(ranked) + 1) + "|")
+    for cat in categories:
+        cells = []
+        for r in ranked:
+            stat = next(
+                (c for c in r.summary.by_category if c.category == cat), None
+            )
+            cells.append(f"{stat.success}/{stat.total}" if stat else "—")
+        lines.append(f"| {cat} | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    return "\n".join(lines)

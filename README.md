@@ -19,7 +19,7 @@ attacks (YAML) → target model (Ollama) → judge → score → report
 2. A library of **attacks** (prompt injection, jailbreaks, system-prompt leaks) is fired at it.
 3. A **judge** decides whether each attack broke the rules (a secret leaked, a canary appeared…). Two are available — a free heuristic one and an optional Claude-based one (see [Judges](#judges)).
 4. A **scorer** turns the verdicts into a robustness score (% of attacks the model withstood).
-5. A **reporter** writes a Markdown + JSON report.
+5. A **reporter** writes the results as Markdown, a self-contained HTML page, and JSON. You can also compare several models side by side (see [Comparing models](#comparing-models)).
 
 By default everything runs **locally and for free** against open models via
 [Ollama](https://ollama.com) — no API keys, and no third-party model is ever
@@ -86,11 +86,55 @@ Two attack suites ship under `data/attacks/`:
 python -m scanner run -t data/targets/acme_bank_naive.yaml -a data/attacks/full.yaml
 ```
 
-Reports are written to `reports/` (Markdown + JSON). Run
-`python -m scanner run --help` for all options.
+Reports are written to `reports/`. By default you get all three formats —
+Markdown, a self-contained **HTML** page (nice to view in a browser or
+screenshot), and JSON (the raw data). Pick with `--format md|html|both` (JSON is
+always written). Run `python -m scanner run --help` for all options.
 
 Define your own target (model + system prompt + secrets to protect) and attack
 suite as YAML — see the examples under `data/`.
+
+## Comparing models
+
+Run the **same** attack suite and system prompt against several models and rank
+them by robustness:
+
+```bash
+python -m scanner compare \
+  --target data/targets/acme_bank.yaml \
+  --attacks data/attacks/full.yaml \
+  --models llama3.1:8b,phi3:mini
+```
+
+This produces a comparison report (Markdown + HTML + JSON) with a leaderboard
+sorted most-robust-first and a per-category breakdown of which attack families
+broke each model. Every model must be pulled in Ollama first
+(`ollama pull <model>`).
+
+A real run of the command above — same hardened system prompt, the 22-attack
+`full.yaml` suite, two models:
+
+| # | Model | Robustness | ASR | Attacks that broke it |
+|---|---|---|---|---|
+| 1 | `llama3.1:8b` (8B) | 🛡️ **81.8/100** | 18.2% | 4 / 22 |
+| 2 | `phi3:mini` (3.8B) | 🛡️ **50.0/100** | 50.0% | 11 / 22 |
+
+Successful attacks by category:
+
+| Category | `llama3.1:8b` | `phi3:mini` |
+|---|---|---|
+| jailbreak | 1/8 | 4/8 |
+| prompt_injection | 1/5 | 3/5 |
+| system_prompt_leak | 2/6 | 4/6 |
+| obfuscation | 0/3 | 0/3 |
+
+The takeaway: under the **same** hardened prompt, the smaller `phi3:mini` falls
+for **11 of 22** attacks versus 4 for `llama3.1:8b` — model size buys safety, not
+just answer quality, and the gap is widest exactly on the subtle families
+(jailbreak, direct injection, prompt-leak). Both models, however, shrug off every
+obfuscation attack (0/3): base64, payload-splitting and reversed text get
+*decoded but not obeyed*. The loud tricks fail; the quiet ones are the dangerous
+ones.
 
 ## Judges
 
@@ -155,10 +199,11 @@ scanner/
   targets/       model adapters (Ollama; pluggable for others)
   attacks/       loads the attack library from YAML
   judges/        decides if an attack succeeded (heuristic + optional Claude judge)
-  scorer.py      computes the robustness score
-  reporter.py    renders the Markdown report
-  runner.py      orchestrates the scan
-  cli.py         command-line interface
+  scorer.py        computes the robustness score
+  reporter.py      renders the Markdown reports (scan + comparison)
+  html_reporter.py renders the self-contained HTML reports (scan + comparison)
+  runner.py        orchestrates the scan (single run + multi-model comparison)
+  cli.py           command-line interface (run + compare)
 data/            example targets and attack suites (starter.yaml, full.yaml)
 tests/           unit tests for the judges, scorer, and attack suites
 ```
@@ -174,7 +219,7 @@ pytest
 - [x] **Milestone 1 — MVP:** Ollama target, YAML attacks, heuristic judge, scoring, report, CLI.
 - [x] **Milestone 2:** optional LLM-as-judge using the Claude API for nuanced verdicts.
 - [x] **Milestone 3:** expanded attack library — ~22 techniques across 4 categories, all free and offline.
-- [ ] **Milestone 4:** HTML reports and multi-model comparison.
+- [x] **Milestone 4:** self-contained HTML reports and a `compare` command that ranks several models side by side.
 - [ ] **Stretch (optional, uses the paid API):** dynamic attacks generated and adapted by Claude.
 
 ## Disclaimer

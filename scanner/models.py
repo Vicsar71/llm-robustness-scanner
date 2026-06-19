@@ -93,3 +93,13 @@ class ScanReport(BaseModel):
     started_at: str
     results: list[AttackResult]
     summary: ScanSummary
+
+
+class ComparisonReport(BaseModel):
+    """Several scans of the SAME target (system prompt + attacks) across
+    different models, so they can be ranked side by side."""
+
+    target_name: str
+    started_at: str
+    attacks_total: int
+    reports: list[ScanReport]  # one per model, in run order
