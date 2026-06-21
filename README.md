@@ -191,21 +191,73 @@ Design notes worth knowing:
 Both judges implement the same `Judge` interface (Strategy pattern), so adding a
 new one — or swapping models — is a single small class.
 
+## Dynamic attacks (optional — uses the Claude API)
+
+A static YAML suite is a fixed checklist. Once a hardened model has "seen" those
+exact prompts, it blocks them every time and its robustness score stops moving.
+The interesting question in AI security is the next one: *can an adaptive attacker
+get past it anyway?* This optional mode turns Claude into the **attacker** (a
+separate role from the `claude` judge) so the scanner stops being a checklist and
+becomes a small autonomous red-teamer.
+
+Two independent capabilities, both off unless you ask:
+
+**`--generate N` — attacks tailored to the target.** Claude reads the target's
+actual system prompt and the secrets it must protect, and writes `N` fresh attacks
+aimed at *that* defense (exploiting gaps it can see in the prompt), instead of
+generic templates. They're appended to whatever the `--attacks` suite already has.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...        # Windows: set ANTHROPIC_API_KEY=...
+# generate 8 bespoke attacks (no static suite needed) and run them
+python -m scanner run -t data/targets/acme_bank.yaml --generate 8 --judge claude
+```
+
+**`--adapt` — escalation.** When an attack is **blocked**, Claude is shown the
+target's refusal and rewrites the attack to get past *that specific* refusal, then
+it's retried — up to `--max-rounds` times (default 2). Every attempt (the seed and
+each rewrite) is recorded, so a model that survives escalation earns its score.
+
+```bash
+# fire the static suite, and escalate anything that gets blocked
+python -m scanner run -t data/targets/acme_bank.yaml \
+  -a data/attacks/full.yaml --adapt --max-rounds 2 --judge claude
+```
+
+Design notes worth knowing:
+
+- **Structured outputs** — attacks come back through a constrained schema
+  (`messages.parse`), as ready-to-run `Attack` objects, not free-form text to parse.
+- **Consistent success signal** — generated attacks aim at a leaked secret (when
+  the target has any) or at making the model emit a canary token, so **either**
+  judge can score them; adaptations inherit the seed's goal and signal.
+- **Adaptive thinking** — the attacker reasons about the defense before writing.
+- **Prompt-injection–safe** — a blocked target's response (which `--adapt` feeds
+  back) is wrapped in delimiters and labelled untrusted, exactly like the judge,
+  so a refusal can't hijack the attacker.
+- **Same pipeline** — generated/adapted attacks are just more `Attack` objects, so
+  the score, reports and `Attack`/`Target` adapters need no changes; escalation is
+  a thin wrapper (`run_adaptive_scan`) around the normal run.
+
+> ⚠️ **Cost:** `--generate` and `--adapt` call a **paid** API, like the Claude
+> judge. They're strictly opt-in; without them nothing is ever sent anywhere and
+> the tool stays free. Missing API key → it fails immediately with a clear message.
+
 ## Project structure
 
 ```
 scanner/
   models.py      data structures (Attack, AttackResult, ScanReport)
   targets/       model adapters (Ollama; pluggable for others)
-  attacks/       loads the attack library from YAML
+  attacks/       loads YAML suites + optional Claude attack generator/adapter
   judges/        decides if an attack succeeded (heuristic + optional Claude judge)
   scorer.py        computes the robustness score
   reporter.py      renders the Markdown reports (scan + comparison)
   html_reporter.py renders the self-contained HTML reports (scan + comparison)
-  runner.py        orchestrates the scan (single run + multi-model comparison)
+  runner.py        orchestrates the scan (single run + adaptive escalation + comparison)
   cli.py           command-line interface (run + compare)
 data/            example targets and attack suites (starter.yaml, full.yaml)
-tests/           unit tests for the judges, scorer, and attack suites
+tests/           unit tests for the judges, generator, runner, scorer, and suites
 ```
 
 ## Tests
@@ -220,7 +272,7 @@ pytest
 - [x] **Milestone 2:** optional LLM-as-judge using the Claude API for nuanced verdicts.
 - [x] **Milestone 3:** expanded attack library — ~22 techniques across 4 categories, all free and offline.
 - [x] **Milestone 4:** self-contained HTML reports and a `compare` command that ranks several models side by side.
-- [ ] **Stretch (optional, uses the paid API):** dynamic attacks generated and adapted by Claude.
+- [x] **Milestone 5 (optional, uses the paid API):** dynamic attacks generated and adapted by Claude — `--generate` and `--adapt` (see [Dynamic attacks](#dynamic-attacks--optional--uses-the-claude-api)).
 
 ## Disclaimer
 

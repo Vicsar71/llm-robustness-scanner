@@ -5,10 +5,13 @@ from __future__ import annotations
 import enum
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
 
+from .attacks.generator import DEFAULT_MODEL as DEFAULT_ATTACKER_MODEL
+from .attacks.generator import ClaudeAttackGenerator
 from .attacks.library import load_attacks
 from .config import load_target_config
 from .judges.base import Judge
@@ -18,7 +21,7 @@ from .judges.heuristic import HeuristicJudge
 from .models import Attack, AttackResult, Verdict
 from .html_reporter import render_comparison_html, render_html
 from .reporter import render_comparison_markdown, render_markdown
-from .runner import run_comparison, run_scan
+from .runner import run_adaptive_scan, run_comparison, run_scan
 from .targets.ollama import OllamaTarget
 
 app = typer.Typer(help="LLM robustness scanner (prompt injection / jailbreaks).")
@@ -55,6 +58,19 @@ def _build_judge(choice: JudgeChoice, judge_model: str) -> Judge:
         raise typer.Exit(code=1)
 
 
+def _build_generator(attacker_model: str) -> ClaudeAttackGenerator:
+    """Create the Claude attacker (for --generate / --adapt), failing friendly."""
+    try:
+        return ClaudeAttackGenerator(model=attacker_model)
+    except Exception as exc:  # noqa: BLE001 - usually a missing API key
+        console.print(
+            "[red]Could not start the Claude attacker.[/red] --generate and "
+            "--adapt need an API key in [bold]ANTHROPIC_API_KEY[/bold].\n"
+            f"[dim]{exc}[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+
 @app.callback()
 def main() -> None:
     """LLM robustness scanner (prompt injection / jailbreaks).
@@ -85,7 +101,12 @@ _VERDICT_STYLE = {
 @app.command()
 def run(
     target: Path = typer.Option(..., "--target", "-t", help="Target YAML file."),
-    attacks: Path = typer.Option(..., "--attacks", "-a", help="Attacks YAML file."),
+    attacks: Optional[Path] = typer.Option(
+        None,
+        "--attacks",
+        "-a",
+        help="Attacks YAML file (seed suite). Optional if --generate is used.",
+    ),
     out: Path = typer.Option(Path("reports"), "--out", "-o", help="Output folder."),
     host: str = typer.Option(
         "http://localhost:11434", help="Ollama API host."
@@ -101,6 +122,29 @@ def run(
         "--judge-model",
         help="Claude model for the 'claude' judge.",
     ),
+    generate: int = typer.Option(
+        0,
+        "--generate",
+        "-g",
+        help="Ask Claude to generate N extra attacks tailored to the target "
+        "(needs ANTHROPIC_API_KEY; paid).",
+    ),
+    adapt: bool = typer.Option(
+        False,
+        "--adapt/--no-adapt",
+        help="When an attack is blocked, have Claude rewrite and retry it "
+        "(escalation; needs ANTHROPIC_API_KEY; paid).",
+    ),
+    max_rounds: int = typer.Option(
+        2,
+        "--max-rounds",
+        help="Max Claude adaptation rounds per attack when --adapt is on.",
+    ),
+    attacker_model: str = typer.Option(
+        DEFAULT_ATTACKER_MODEL,
+        "--attacker-model",
+        help="Claude model used to generate/adapt attacks.",
+    ),
     fmt: OutputFormat = typer.Option(
         OutputFormat.both,
         "--format",
@@ -110,7 +154,28 @@ def run(
 ) -> None:
     """Run the attack suite against the target model and generate the report."""
     target_cfg = load_target_config(target)
-    attack_list = load_attacks(attacks)
+    attack_list = load_attacks(attacks) if attacks is not None else []
+
+    # --generate and --adapt both turn Claude into the attacker; build it once.
+    generator = _build_generator(attacker_model) if (generate > 0 or adapt) else None
+
+    if generate > 0:
+        console.print(
+            f"[bold]Generating {generate} attacks with Claude[/bold] "
+            f"([cyan]{attacker_model}[/cyan])…"
+        )
+        try:
+            attack_list += generator.generate(target_cfg, n=generate)
+        except Exception as exc:  # noqa: BLE001 - surface API errors cleanly
+            console.print(f"[red]Attack generation failed:[/red] [dim]{exc}[/dim]")
+            raise typer.Exit(code=1)
+
+    if not attack_list:
+        console.print(
+            "[red]No attacks to run.[/red] Pass [bold]--attacks[/bold] and/or "
+            "[bold]--generate N[/bold]."
+        )
+        raise typer.Exit(code=2)
 
     console.print(
         f"[bold]Target:[/bold] {target_cfg.name}  "
@@ -118,7 +183,9 @@ def run(
     )
     console.print(
         f"[bold]Attacks:[/bold] {len(attack_list)}   "
-        f"[bold]Judge:[/bold] {judge.value}\n"
+        f"[bold]Judge:[/bold] {judge.value}"
+        + (f"   [bold]Adapt:[/bold] on (≤{max_rounds} rounds)" if adapt else "")
+        + "\n"
     )
 
     model_target = OllamaTarget(
@@ -141,9 +208,27 @@ def run(
             f"({r.latency_s}s)  {r.rationale}"
         )
 
-    report = run_scan(
-        model_target, target_cfg, attack_list, judge_impl, on_progress, on_result
-    )
+    def on_adapt(
+        blocked: Attack, round_no: int, new_attack: Optional[Attack], error: Optional[str]
+    ) -> None:
+        if error is not None:
+            console.print(f"    [dim]↳ could not adapt (round {round_no}): {error}[/dim]")
+        else:
+            console.print(
+                f"    [magenta]↳ adapting[/magenta] [bold]{blocked.id}[/bold] "
+                f"(round {round_no}) → [bold]{new_attack.id}[/bold]…"
+            )
+
+    if adapt:
+        report = run_adaptive_scan(
+            model_target, target_cfg, attack_list, judge_impl, generator,
+            max_rounds=max_rounds,
+            on_progress=on_progress, on_result=on_result, on_adapt=on_adapt,
+        )
+    else:
+        report = run_scan(
+            model_target, target_cfg, attack_list, judge_impl, on_progress, on_result
+        )
 
     s = report.summary
     console.print(
